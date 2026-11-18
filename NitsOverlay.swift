@@ -101,12 +101,14 @@ final class OverlayWindow: NSWindow {
         return label
     }
 
-    /// Atualiza os textos, posiciona na tela alvo e agenda o fade-out 1s após a última tecla.
-    func show(_ value: Float, on screen: NSScreen) {
+    /// Atualiza os textos, posiciona na tela alvo (alinhado à HUD nativa quando disponível)
+    /// e agenda o fade-out 1s após a última tecla.
+    func show(_ value: Float, on screen: NSScreen, hudMinX: CGFloat? = nil) {
         nitsLabel.stringValue = "\(nits(value)) nits"
         percentLabel.stringValue = "\(Int((value * 100).rounded()))%"
         let v = screen.visibleFrame
-        setFrameOrigin(NSPoint(x: v.maxX - frame.width - 32, y: v.maxY - frame.height - 46))
+        let x = hudMinX.map { $0 + 74 } ?? (v.maxX - frame.width - 36)
+        setFrameOrigin(NSPoint(x: x, y: v.maxY - frame.height - 46))
         NSObject.cancelPreviousPerformRequests(withTarget: self)
         NSAnimationContext.runAnimationGroup { $0.duration = 0; animator().alphaValue = 1 }
         orderFrontRegardless()
@@ -349,13 +351,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         model.keysGranted = startBrightnessKeyTap()
     }
 
-    /// Exibe o overlay imediatamente e reatualiza após 30ms para refletir o novo brilho pós-evento HID.
+    /// Retorna o `minX` da janela da HUD nativa (`MenuBarAgent`) na tela alvo, se já estiver visível.
+    private func nativeHUDMinX(on display: CGDirectDisplayID) -> CGFloat? {
+        let windows = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] ?? []
+        let d = CGDisplayBounds(display)
+        for w in windows {
+            guard w[kCGWindowOwnerName as String] as? String == "MenuBarAgent",
+                  let dict = w[kCGWindowBounds as String] as? NSDictionary,
+                  let r = CGRect(dictionaryRepresentation: dict),
+                  r.minX >= d.midX && r.maxX <= d.maxX + 20 && r.minY < d.minY + 120 && r.height > 40 && r.height <= 200 else {
+                continue
+            }
+            return r.minX
+        }
+        return nil
+    }
+
+    /// Exibe o overlay imediatamente e reatualiza após 40ms para refletir o brilho e a posição da HUD nativa.
     private func triggerOverlay() {
         guard model.enabled, let t = target else { return }
-        overlay.show(brightness(t.id), on: t.screen)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in
+        overlay.show(brightness(t.id), on: t.screen, hudMinX: nativeHUDMinX(on: t.id))
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { [weak self] in
             guard let self, self.model.enabled, let t = self.target else { return }
-            self.overlay.show(brightness(t.id), on: t.screen)
+            self.overlay.show(brightness(t.id), on: t.screen, hudMinX: self.nativeHUDMinX(on: t.id))
         }
     }
 }
