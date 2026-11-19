@@ -1,9 +1,9 @@
 import Cocoa
 import SwiftUI
 
-// MARK: - Brilho e Tela
+// MARK: - Leitura de Brilho e Tela Alvo
 
-/// Ponteiro para `DisplayServicesGetBrightness` (framework privado), resolvido uma única vez.
+/// Ponteiro para `DisplayServicesGetBrightness` (framework privado), resolvido uma única vez na inicialização.
 private typealias GetBrightnessFn = @convention(c) (CGDirectDisplayID, UnsafeMutablePointer<Float>) -> Int32
 private let getBrightnessFn: GetBrightnessFn? = {
     guard let h = dlopen("/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices", RTLD_LAZY),
@@ -11,7 +11,7 @@ private let getBrightnessFn: GetBrightnessFn? = {
     return unsafeBitCast(sym, to: GetBrightnessFn.self)
 }()
 
-/// Brilho atual (0.0–1.0) do display informado.
+/// Lê o brilho atual (0.0–1.0) do display informado via `DisplayServices`.
 func brightness(_ display: CGDirectDisplayID) -> Float {
     var value: Float = 0
     _ = getBrightnessFn?(display, &value)
@@ -23,7 +23,8 @@ func nits(_ value: Float) -> Int {
     Int((1 + 599 * pow(Double(value), 2.3)).rounded())
 }
 
-/// Tela embutida do MacBook (ou a primeira tela, com a tampa fechada) e seu ID de display.
+/// Localiza a tela embutida do MacBook (ou usa a primeira tela como fallback em modo tampa fechada)
+/// para que o overlay apareça sempre no display interno, mesmo com outra tela ativa.
 func builtInDisplay() -> (screen: NSScreen, id: CGDirectDisplayID)? {
     var fallback: (screen: NSScreen, id: CGDirectDisplayID)?
     for screen in NSScreen.screens {
@@ -35,13 +36,14 @@ func builtInDisplay() -> (screen: NSScreen, id: CGDirectDisplayID)? {
     return fallback
 }
 
-// MARK: - Teclas de Brilho (CGEventTap)
+// MARK: - Monitoramento de Entrada (CGEventTap)
 
 private var keyTap: CFMachPort?
 private var onBrightnessKey: () -> Void = {}
 
-/// Escuta (somente leitura) as teclas de brilho no nível HID, inclusive em 0% e 100%.
-/// Requer a permissão de Monitoramento de Entrada. Retorna `true` se o tap estiver ativo.
+/// Registra um `CGEventTap` somente leitura no nível HID (`.cghidEventTap`) para capturar as teclas
+/// de brilho com 0% de uso de CPU em repouso, inclusive nos extremos de 0% e 100%.
+/// Requer permissão de Monitoramento de Entrada; retorna `true` quando ativo.
 func startBrightnessKeyTap() -> Bool {
     if keyTap != nil { return true }
     guard CGPreflightListenEventAccess(),
@@ -49,12 +51,13 @@ func startBrightnessKeyTap() -> Bool {
             tap: .cghidEventTap,
             place: .headInsertEventTap,
             options: .listenOnly,
-            eventsOfInterest: 1 << 14, // NX_SYSDEFINED (teclas especiais)
+            eventsOfInterest: 1 << 14, // NX_SYSDEFINED (teclas especiais de mídia e brilho)
             callback: { _, type, event, _ in
+                // Reativa automaticamente caso o macOS suspenda o tap por timeout ou entrada do usuário
                 if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput, let tap = keyTap {
-                    CGEvent.tapEnable(tap: tap, enable: true) // reativa se o sistema desligar o tap
+                    CGEvent.tapEnable(tap: tap, enable: true)
                 } else if let e = NSEvent(cgEvent: event), e.subtype.rawValue == 8 {
-                    // data1: código da tecla nos 16 bits altos (2 = brilho +, 3 = brilho −); 0x0A = pressionada
+                    // Bits 16–31 trazem o código da tecla (2 = brilho +, 3 = brilho −); 0x0A indica key-down
                     let code = (e.data1 & 0xFFFF_0000) >> 16
                     if (e.data1 & 0xFF00) >> 8 == 0x0A, code == 2 || code == 3 { onBrightnessKey() }
                 }
@@ -68,25 +71,33 @@ func startBrightnessKeyTap() -> Bool {
     return true
 }
 
-// MARK: - Overlay
+// MARK: - Janela Flutuante do Overlay
 
-/// Janela transparente que exibe nits e porcentagem no canto superior direito, sem capturar cliques.
-final class OverlayWindow: NSWindow {
+/// Painel flutuante transparente (`NSPanel` não ativável) que exibe nits e porcentagem sem roubar foco.
+/// Usa `.nonactivatingPanel`, `.fullScreenAuxiliary` e `level = .screenSaver` (1000) para renderizar
+/// acima da HUD nativa (`layer = 101`) tanto no Desktop quanto em Spaces em tela cheia.
+final class OverlayWindow: NSPanel {
     private let nitsLabel = OverlayWindow.label(NSRect(x: 16, y: 0, width: 100, height: 20), .left)
     private let percentLabel = OverlayWindow.label(NSRect(x: 136, y: 0, width: 100, height: 20), .right)
+    private var isFadingOut = false
 
     init() {
-        super.init(contentRect: NSRect(x: 0, y: 0, width: 260, height: 24), styleMask: .borderless, backing: .buffered, defer: true)
-        level = .screenSaver
+        super.init(contentRect: NSRect(x: 0, y: 0, width: 260, height: 24),
+                   styleMask: [.borderless, .nonactivatingPanel],
+                   backing: .buffered, defer: false)
+        level = .screenSaver // Mantido após styleMask (evitar isFloatingPanel = true, que rebaixa para .floating)
+        hidesOnDeactivate = false
         isOpaque = false
+        alphaValue = 0
         backgroundColor = .clear
         hasShadow = false
         ignoresMouseEvents = true
-        collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         contentView?.addSubview(nitsLabel)
         contentView?.addSubview(percentLabel)
     }
 
+    /// Cria um rótulo branco semitransparente com sombra sutil para leitura sobre a pílula de vidro.
     private static func label(_ frame: NSRect, _ alignment: NSTextAlignment) -> NSTextField {
         let label = NSTextField(labelWithString: "")
         label.frame = frame
@@ -101,24 +112,28 @@ final class OverlayWindow: NSWindow {
         return label
     }
 
-    /// Atualiza os textos, posiciona na tela alvo (alinhado à HUD nativa quando disponível)
-    /// e agenda o fade-out 1s após a última tecla.
-    func show(_ value: Float, on screen: NSScreen, hudMinX: CGFloat? = nil) {
+    /// Atualiza textos e posição alinhada à HUD nativa, aplica fade-in apenas se ainda não estava
+    /// totalmente visível e agenda o fade-out 1s após a última tecla pressionada.
+    func show(_ value: Float, on screen: NSScreen, hudRect: CGRect) {
+        let needsFadeIn = !isVisible || isFadingOut || alphaValue < 1
+        isFadingOut = false
+        NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(fadeOut), object: nil)
         nitsLabel.stringValue = "\(nits(value)) nits"
         percentLabel.stringValue = "\(Int((value * 100).rounded()))%"
-        let v = screen.visibleFrame
-        let x = hudMinX.map { $0 + 74 } ?? (v.maxX - frame.width - 36)
-        setFrameOrigin(NSPoint(x: x, y: v.maxY - frame.height - 46))
-        NSObject.cancelPreviousPerformRequests(withTarget: self)
-        NSAnimationContext.runAnimationGroup { $0.duration = 0; animator().alphaValue = 1 }
+        setFrameOrigin(NSPoint(x: hudRect.minX + 74, y: screen.frame.maxY - hudRect.minY - frame.height - 46))
+        if !isVisible { alphaValue = 0 }
         orderFrontRegardless()
+        if needsFadeIn {
+            NSAnimationContext.runAnimationGroup { $0.duration = 0.18; animator().alphaValue = 1 }
+        }
         perform(#selector(fadeOut), with: nil, afterDelay: 1.0)
     }
 
-    /// Inicia o fade-out de 0.3s junto com o desaparecimento da HUD nativa.
+    /// Anima a saída em 0.3s e remove a janela da tela apenas se nenhum novo ajuste tiver interrompido o fade.
     @objc func fadeOut() {
+        isFadingOut = true
         NSAnimationContext.runAnimationGroup({ $0.duration = 0.3; animator().alphaValue = 0 }) { [weak self] in
-            if self?.alphaValue == 0 { self?.orderOut(nil) }
+            if self?.isFadingOut == true { self?.orderOut(nil) }
         }
     }
 }
@@ -245,22 +260,24 @@ struct SettingsView: View {
     }
 }
 
-// MARK: - AppDelegate
+// MARK: - Ciclo de Vida da Aplicação e Sincronia com a HUD
 
-/// Coordena o gatilho por teclas de brilho, a janela de configuração e a presença na Dock.
+/// Gerencia a janela de configuração (e sua alternância na Dock), as permissões do sistema
+/// e a exibição do overlay alinhado à janela da HUD nativa do `MenuBarAgent`.
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let model = Model()
     private let overlay = OverlayWindow()
     private var window: NSWindow?
     private var target = builtInDisplay()
+    private var attemptsLeft = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Instância única: uma segunda cópia (ex.: lançada pelo LaunchAgent) encerra imediatamente
+        // Instância única: uma segunda cópia (ex.: aberta pelo LaunchAgent) encerra imediatamente
         if NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "").count > 1 {
             return NSApp.terminate(nil)
         }
 
-        // Menu mínimo para Cmd+W (fechar → segundo plano) e Cmd+Q (encerrar)
+        // Menu mínimo para habilitar os atalhos padrão Cmd+W (ocultar) e Cmd+Q (encerrar)
         let appMenu = NSMenu()
         appMenu.addItem(withTitle: "Fechar Janela", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         appMenu.addItem(withTitle: "Encerrar NitsOverlay", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -269,38 +286,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSApp.mainMenu = NSMenu()
         NSApp.mainMenu?.addItem(appItem)
 
-        // Atualiza a tela alvo quando monitores são conectados/desconectados
+        // Atualiza o display alvo quando monitores externos são conectados ou desconectados
         _ = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
                                                    object: nil, queue: .main) { [weak self] _ in
             self?.target = builtInDisplay()
         }
 
         onBrightnessKey = { [weak self] in self?.triggerOverlay() }
-        refreshPermissions()
+        model.keysGranted = startBrightnessKeyTap()
 
-        // LSUIElement: o app inicia fora da Dock; só abre a janela se não foi lançado no login
+        // LSUIElement mantém o app fora da Dock no boot (--background); abertura manual exibe a janela
         if !CommandLine.arguments.contains("--background") { showWindow() }
     }
 
-    /// Reabrir o app (Finder, Spotlight, Dock) mostra a janela novamente.
+    /// Reabrir o app pelo Finder, Spotlight ou Dock traz a janela de configuração de volta.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         showWindow()
         return true
     }
 
-    /// Ao voltar ao app (ex.: após autorizar nos Ajustes), revalida as permissões.
+    /// Revalida a permissão de Monitoramento de Entrada ao retornar dos Ajustes do Sistema.
     func applicationDidBecomeActive(_ notification: Notification) {
-        refreshPermissions()
+        model.keysGranted = startBrightnessKeyTap()
     }
 
-    /// Fechar a janela apenas oculta o app para o segundo plano.
+    /// Intercepta o fechamento da janela para ocultar o app da Dock mantendo-o ativo em segundo plano.
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         hideWindow()
         return false
     }
 
-    // MARK: Janela
+    // MARK: Janela de Configuração
 
+    /// Constrói (se liberada) a janela Liquid Glass, promove o app para a Dock (.regular) e ativa o foco.
     private func showWindow() {
         if window == nil {
             let view = SettingsView(
@@ -330,50 +348,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSApp.activate()
     }
 
+    /// Libera a árvore SwiftUI da memória e remove o ícone da Dock (.accessory).
     private func hideWindow() {
         window?.orderOut(nil)
         window = nil
         NSApp.setActivationPolicy(.accessory)
     }
 
+    /// Solicita o Monitoramento de Entrada e abre os Ajustes caso ainda falte autorização manual.
     private func authorize() {
         if !CGRequestListenEventAccess(),
            let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent") {
             NSWorkspace.shared.open(url)
         }
-        refreshPermissions()
-    }
-
-    // MARK: Permissões e Overlay
-
-    /// Ativa o tap de teclas se o Monitoramento de Entrada estiver autorizado.
-    private func refreshPermissions() {
         model.keysGranted = startBrightnessKeyTap()
     }
 
-    /// Retorna o `minX` da janela da HUD nativa (`MenuBarAgent`) na tela alvo, se já estiver visível.
-    private func nativeHUDMinX(on display: CGDirectDisplayID) -> CGFloat? {
+    // MARK: Detecção da HUD Nativa e Disparo do Overlay
+
+    /// Retorna o `CGRect` (coordenadas CG) da pílula de brilho do `MenuBarAgent` no display embutido.
+    /// Filtra antes por `layer == 101` para descartar a barra de menus (`layer == 25`) sem alocar `CGRect`.
+    private func nativeHUDRect(on display: CGDirectDisplayID) -> CGRect? {
         let windows = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] ?? []
         let d = CGDisplayBounds(display)
         for w in windows {
             guard w[kCGWindowOwnerName as String] as? String == "MenuBarAgent",
+                  w[kCGWindowLayer as String] as? Int == 101,
                   let dict = w[kCGWindowBounds as String] as? NSDictionary,
                   let r = CGRect(dictionaryRepresentation: dict),
-                  r.minX >= d.midX && r.maxX <= d.maxX + 20 && r.minY < d.minY + 120 && r.height > 40 && r.height <= 200 else {
+                  d.intersects(r), r.width > 200, r.width <= 480, r.height > 40, r.height <= 220 else {
                 continue
             }
-            return r.minX
+            return r
         }
         return nil
     }
 
-    /// Exibe o overlay imediatamente e reatualiza após 40ms para refletir o brilho e a posição da HUD nativa.
+    /// Agenda uma verificação única (com debounce) para exibir o overlay assim que a HUD nativa surgir.
     private func triggerOverlay() {
+        guard model.enabled else { return }
+        attemptsLeft = 15
+        NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(checkHUD), object: nil)
+        perform(#selector(checkHUD), with: nil, afterDelay: 0.02)
+    }
+
+    /// Verifica a presença da HUD nativa a cada 20ms (até 15 tentativas = 300ms) para posicionar o overlay.
+    @objc private func checkHUD() {
         guard model.enabled, let t = target else { return }
-        overlay.show(brightness(t.id), on: t.screen, hudMinX: nativeHUDMinX(on: t.id))
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { [weak self] in
-            guard let self, self.model.enabled, let t = self.target else { return }
-            self.overlay.show(brightness(t.id), on: t.screen, hudMinX: self.nativeHUDMinX(on: t.id))
+        if let r = nativeHUDRect(on: t.id) {
+            overlay.show(brightness(t.id), on: t.screen, hudRect: r)
+        } else if attemptsLeft > 0 {
+            attemptsLeft -= 1
+            perform(#selector(checkHUD), with: nil, afterDelay: 0.02)
         }
     }
 }
