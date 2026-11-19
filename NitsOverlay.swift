@@ -79,7 +79,8 @@ func startBrightnessKeyTap() -> Bool {
 final class OverlayWindow: NSPanel {
     private let nitsLabel = OverlayWindow.label(NSRect(x: 16, y: 0, width: 100, height: 20), .left)
     private let percentLabel = OverlayWindow.label(NSRect(x: 136, y: 0, width: 100, height: 20), .right)
-    private var isFadingOut = false
+    /// Chamado exatamente ao final do fade visual (0.28s) para expirar o ID da HUD nativa.
+    var onFadeComplete: (() -> Void)?
 
     init() {
         super.init(contentRect: NSRect(x: 0, y: 0, width: 260, height: 24),
@@ -115,9 +116,8 @@ final class OverlayWindow: NSPanel {
     /// Atualiza textos e posição alinhada à HUD nativa, aplica fade-in apenas se ainda não estava
     /// totalmente visível e agenda o fade-out 1s após a última tecla pressionada.
     func show(_ value: Float, on screen: NSScreen, hudRect: CGRect) {
-        let needsFadeIn = !isVisible || isFadingOut || alphaValue < 1
-        isFadingOut = false
-        NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(fadeOut), object: nil)
+        let needsFadeIn = !isVisible || alphaValue < 1
+        NSObject.cancelPreviousPerformRequests(withTarget: self)
         nitsLabel.stringValue = "\(nits(value)) nits"
         percentLabel.stringValue = "\(Int((value * 100).rounded()))%"
         setFrameOrigin(NSPoint(x: hudRect.minX + 74, y: screen.frame.maxY - hudRect.minY - frame.height - 46))
@@ -129,12 +129,17 @@ final class OverlayWindow: NSPanel {
         perform(#selector(fadeOut), with: nil, afterDelay: 1.0)
     }
 
-    /// Anima a saída em 0.3s e remove a janela da tela apenas se nenhum novo ajuste tiver interrompido o fade.
-    @objc func fadeOut() {
-        isFadingOut = true
-        NSAnimationContext.runAnimationGroup({ $0.duration = 0.3; animator().alphaValue = 0 }) { [weak self] in
-            if self?.isFadingOut == true { self?.orderOut(nil) }
-        }
+    /// Anima a saída em 0.28s e agenda o encerramento pelo temporizador direto (sem depender do
+    /// completionHandler do NSAnimationContext, que dispara ~285ms depois do alpha zerar).
+    @objc private func fadeOut() {
+        NSAnimationContext.runAnimationGroup { $0.duration = 0.28; animator().alphaValue = 0 }
+        perform(#selector(finishFade), with: nil, afterDelay: 0.28)
+    }
+
+    /// Remove o overlay da tela e notifica o fim do fade visual caso nenhum novo ajuste o tenha cancelado.
+    @objc private func finishFade() {
+        orderOut(nil)
+        onFadeComplete?()
     }
 }
 
@@ -151,6 +156,7 @@ private let loginPlist = FileManager.default.homeDirectoryForCurrentUser
     /// Cria ou remove o LaunchAgent em ~/Library/LaunchAgents para iniciar em segundo plano no login.
     var launchAtLogin = FileManager.default.fileExists(atPath: loginPlist.path) {
         didSet {
+            guard launchAtLogin != oldValue else { return }
             let fm = FileManager.default
             if launchAtLogin, let exe = Bundle.main.executablePath {
                 try? fm.createDirectory(at: loginPlist.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -175,6 +181,11 @@ struct SettingsView: View {
     let onAuthorize: () -> Void
     let onDone: () -> Void
 
+    private var status: (text: String, color: Color) {
+        if !model.keysGranted { return ("Autorize para ativar", .yellow) }
+        return model.enabled ? ("Ativo em segundo plano", .green) : ("Overlay pausado", .secondary)
+    }
+
     var body: some View {
         VStack(spacing: 18) {
             // Cabeçalho: ícone do app, nome e status
@@ -183,12 +194,8 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("NitsOverlay").font(.system(size: 20, weight: .bold, design: .rounded))
                     HStack(spacing: 6) {
-                        Circle()
-                            .fill(!model.keysGranted ? Color.yellow : (model.enabled ? Color.green : Color.secondary))
-                            .frame(width: 7, height: 7)
-                        Text(!model.keysGranted
-                             ? "Autorize para ativar"
-                             : (model.enabled ? "Ativo em segundo plano" : "Overlay pausado"))
+                        Circle().fill(status.color).frame(width: 7, height: 7)
+                        Text(status.text)
                     }
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
@@ -270,6 +277,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var window: NSWindow?
     private var target = builtInDisplay()
     private var attemptsLeft = 0
+    private var activeHUDID: CGWindowID = 0
+    private var expiredHUDID: CGWindowID = 0
+    private var lastBrightness: Float = -1
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Instância única: uma segunda cópia (ex.: aberta pelo LaunchAgent) encerra imediatamente
@@ -292,6 +302,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self?.target = builtInDisplay()
         }
 
+        overlay.onFadeComplete = { [weak self] in
+            guard let self else { return }
+            self.expiredHUDID = self.activeHUDID
+        }
         onBrightnessKey = { [weak self] in self?.triggerOverlay() }
         model.keysGranted = startBrightnessKeyTap()
 
@@ -366,20 +380,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // MARK: Detecção da HUD Nativa e Disparo do Overlay
 
-    /// Retorna o `CGRect` (coordenadas CG) da pílula de brilho do `MenuBarAgent` no display embutido.
-    /// Filtra antes por `layer == 101` para descartar a barra de menus (`layer == 25`) sem alocar `CGRect`.
-    private func nativeHUDRect(on display: CGDirectDisplayID) -> CGRect? {
+    /// Retorna `kCGWindowNumber` e `CGRect` da pílula de brilho do `MenuBarAgent` no display embutido.
+    /// Filtra por `layer == 101` (descarta a barra de menus) e só ignora `expiredHUDID` quando
+    /// `allowExpired` é falso (sem mudança real de brilho), evitando reabrir o overlay na cauda
+    /// zumbi de ~275ms sem bloquear ajustes reais feitos durante o fade-out.
+    private func nativeHUD(on display: CGDirectDisplayID, allowExpired: Bool) -> (id: CGWindowID, rect: CGRect)? {
         let windows = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] ?? []
         let d = CGDisplayBounds(display)
         for w in windows {
             guard w[kCGWindowOwnerName as String] as? String == "MenuBarAgent",
                   w[kCGWindowLayer as String] as? Int == 101,
+                  let id = w[kCGWindowNumber as String] as? CGWindowID,
+                  allowExpired || id != expiredHUDID,
                   let dict = w[kCGWindowBounds as String] as? NSDictionary,
                   let r = CGRect(dictionaryRepresentation: dict),
                   d.intersects(r), r.width > 200, r.width <= 480, r.height > 40, r.height <= 220 else {
                 continue
             }
-            return r
+            return (id, r)
         }
         return nil
     }
@@ -392,11 +410,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         perform(#selector(checkHUD), with: nil, afterDelay: 0.02)
     }
 
-    /// Verifica a presença da HUD nativa a cada 20ms (até 15 tentativas = 300ms) para posicionar o overlay.
+    /// Verifica a HUD nativa a cada 20ms (até 300ms): se o brilho mudou, aceita inclusive o ID
+    /// recém-expirado (que o `MenuBarAgent` reativa); se o brilho ficou travado (0%/100%), exige
+    /// um novo `CGWindowID` para não exibir o overlay sozinho durante a cauda invisível.
     @objc private func checkHUD() {
         guard model.enabled, let t = target else { return }
-        if let r = nativeHUDRect(on: t.id) {
-            overlay.show(brightness(t.id), on: t.screen, hudRect: r)
+        let current = brightness(t.id)
+        let brightnessChanged = abs(current - lastBrightness) > 0.0005
+        if let hud = nativeHUD(on: t.id, allowExpired: brightnessChanged) {
+            lastBrightness = current
+            activeHUDID = hud.id
+            expiredHUDID = 0
+            overlay.show(current, on: t.screen, hudRect: hud.rect)
         } else if attemptsLeft > 0 {
             attemptsLeft -= 1
             perform(#selector(checkHUD), with: nil, afterDelay: 0.02)

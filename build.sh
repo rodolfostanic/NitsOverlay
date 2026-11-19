@@ -5,13 +5,12 @@ APP="/Applications/NitsOverlay.app"
 ID="br.com.stanic.NitsOverlay"
 PLIST="$HOME/Library/LaunchAgents/$ID.plist"
 
-# Encerra a instância em execução e remove eventual agente antigo do SMAppService
+# Encerra a instância em execução e descarrega o agente no launchd
 killall NitsOverlay 2>/dev/null || true
 launchctl bootout "gui/$(id -u)/$ID" 2>/dev/null || true
 
 # Estrutura do bundle
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-rm -rf "$APP/Contents/Library"
 
 # Ícone: gerado apenas se ainda não existir no projeto
 [ -f AppIcon.icns ] || swift generate_icon.swift AppIcon.icns
